@@ -2,12 +2,11 @@ import os
 import torch
 import torchvision.transforms as transforms
 import numpy as np
-import matplotlib.pyplot as plt
 import random
+from PIL import Image
 
 from utils.equations import FUNC_TYPES, generate_equation_string
 from utils.plotting import create_comparison_graphs
-from config.config import ITERATIVE_MAX_ATTEMPTS
 
 def evaluate_model(model, dataset, num_samples=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -42,7 +41,7 @@ def evaluate_model(model, dataset, num_samples=10):
 
 def predict_from_image(model, image_path):
     """Predict equation from a single image file"""
-    
+
     if not os.path.exists(image_path):
         print(f"❌ Image file not found: {image_path}")
         return None
@@ -54,7 +53,6 @@ def predict_from_image(model, image_path):
     model.eval()
     
     # Load and preprocess image
-    from PIL import Image
     img = Image.open(image_path).convert('RGB')
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
