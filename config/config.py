@@ -1,0 +1,20 @@
+import os
+import warnings
+
+warnings.filterwarnings('ignore')
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+
+
+TRAINING_IMAGE_SIZE = 224
+
+VALIDATION_SAMPLE_SIZE = 100
+
+ITERATIVE_MAX_ATTEMPTS = 100
+
+EPOCHS = 40
+
+NUM_WORKERS = 4
+
+TRAINING_SAMPLE_SIZE = 100000
+
+TRAIN_BATCH_SIZE = 100
