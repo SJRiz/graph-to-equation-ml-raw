@@ -4,7 +4,7 @@ from PIL import Image
 
 def plot_points(points):
     fig, ax = plt.subplots(figsize=(4, 4))
-    
+
     xs, ys = zip(*points)  # unzip into two lists
     ax.plot(xs, ys, color="darkblue", linewidth=2.5)
     
