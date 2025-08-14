@@ -18,7 +18,7 @@ class EquationDataset(Dataset):
             self.transform = transforms.Compose([
                 transforms.Resize((image_size, image_size)),
                 transforms.ToTensor(),
-                transforms.ColorJitter(brightness=0.1, contrast=0.1),
+                transforms.ColorJitter(brightness=0.05, contrast=0.05),  # Reduced augmentation
                 transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
             ])
@@ -39,9 +39,14 @@ class EquationDataset(Dataset):
         func_idx = self.function_types.index(func_type)
 
         # Generate function parameters
-        # Up to degree 6
         if func_type == 'polynomial':
-            params = sample_polynomial_params(max_deg=6)[::-1]
+            # sample_polynomial_params returns ascending order [a0, a1, ..., a6]
+            params_ascending = sample_polynomial_params(max_deg=6)
+            params = params_ascending
+            
+            # DEBUG: Print first few samples to verify
+            #if idx < 5:
+                #print(f"Sample {idx}: params = {params}, equation = {generate_equation_string(func_type, params)}")
 
         equation = generate_equation_string(func_type, params)
 
@@ -49,14 +54,16 @@ class EquationDataset(Dataset):
         img = render_plot_to_tensor(func_type, params)
         img_tensor = self.transform(img)
 
-        if idx % 3 == 0:
-            # Go up from /data to root
-            root_dir = os.path.dirname(os.path.dirname(__file__))  
-            output_dir = os.path.join(root_dir, "output")
-            os.makedirs(output_dir, exist_ok=True)  # make sure the folder exists
-
-            save_path = os.path.join(output_dir, "sample.png")
-            img.save(save_path)
+        # Save sample images less frequently for debugging
+        if idx % 500 == 0:
+            try:
+                root_dir = os.path.dirname(os.path.dirname(__file__))  
+                output_dir = os.path.join(root_dir, "output")
+                os.makedirs(output_dir, exist_ok=True)
+                save_path = os.path.join(output_dir, f"sample.png")
+                img.save(save_path)
+            except Exception as e:
+                print("ERROR: ", str(e))
 
         return {
             'image': img_tensor,

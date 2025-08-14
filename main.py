@@ -35,9 +35,7 @@ def main():
             
             if result:
                 print(f"\n🎯 Prediction Result:")
-                print(f"Function Type: {result['type']}")
                 print(f"Equation: {result['equation']}")
-                print(f"Confidence: {result['confidence']:.4f}")
                 
         elif choice == '3':
             confirm = input("This will retrain the model from scratch. Continue? (y/n): ").strip().lower()

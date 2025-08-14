@@ -13,156 +13,67 @@ from config.config import EPOCHS, NUM_WORKERS, TRAIN_BATCH_SIZE, TRAINING_SAMPLE
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(SCRIPT_DIR, '..', 'output', 'best_model.pth')
 
-def find_polynomial_roots(coeffs, derivative_order=0):
-    """Find roots of polynomial or its derivatives using numpy."""
-    
-    # Coefficients are already in numpy polynomial format (highest degree first)
-    poly_coeffs = coeffs
-    
-    # Take derivatives
-    for _ in range(derivative_order):
-        if len(poly_coeffs) <= 1:
-            return torch.tensor([], device=coeffs.device, dtype=coeffs.dtype)
-        
-        # Derivative: [6*a6, 5*a5, ..., 1*a1]
-        degrees = torch.arange(len(poly_coeffs)-1, 0, -1, device=coeffs.device, dtype=coeffs.dtype)
-        poly_coeffs = poly_coeffs[:-1] * degrees
-    
-    if len(poly_coeffs) <= 1:
-        return torch.tensor([], device=coeffs.device, dtype=coeffs.dtype)
-    
-    # Convert back to numpy for root finding
-    poly_coeffs_np = poly_coeffs.detach().cpu().numpy()
-    
-    try:
-        # Find all roots
-        roots = np.roots(poly_coeffs_np)
-        
-        # Filter for real roots in [-5, 5]
-        real_roots = []
-        for root in roots:
-            if np.isreal(root):
-                real_val = np.real(root)
-                if -5.0 <= real_val <= 5.0:
-                    real_roots.append(real_val)
-        
-        return torch.tensor(real_roots, device=coeffs.device, dtype=coeffs.dtype)
-    
-    except:
-        # If root finding fails, return empty tensor
-        return torch.tensor([], device=coeffs.device, dtype=coeffs.dtype)
-
-
-def compute_special_points_loss(param_pred_denorm, param_labels_raw, x_tensor, x_powers, 
-                               crit_weight=5.0, inflection_weight=2.0, gaussian_sigma=0.3):
-    """Compute loss that prioritizes critical points and inflection points using a gaussian window"""
-
-    batch_size = param_pred_denorm.shape[0]
-    
-    total_weighted_loss = 0.0
-    total_weight = 0.0
-    
-    # Base y values (need to flip coeffs for x_powers multiplication)
-    y_pred_raw = torch.matmul(param_pred_denorm.flip(-1), x_powers.T)  # (B, N)
-    y_true_raw = torch.matmul(param_labels_raw.flip(-1), x_powers.T)   # (B, N)
-    
-    for b in range(batch_size):
-        # Get coefficients for this batch item
-        true_coeffs = param_labels_raw[b]   # (7,)
-        
-        # Find critical points (roots of first derivative)
-        true_crit_points = find_polynomial_roots(true_coeffs, derivative_order=1)
-        
-        # Find inflection points (roots of second derivative)
-        true_inflection_points = find_polynomial_roots(true_coeffs, derivative_order=2)
-        
-        # Combine all special points
-        all_special_points = []
-        all_weights = []
-        
-        # Add critical points
-        for point in true_crit_points:
-            all_special_points.append(point)
-            all_weights.append(crit_weight)
-        
-        # Add inflection points
-        for point in true_inflection_points:
-            all_special_points.append(point)
-            all_weights.append(inflection_weight)
-        
-        if len(all_special_points) == 0:
-            # No special points, use uniform weighting
-            weights = torch.ones_like(x_tensor)
-        else:
-            # Create gaussian weights centered at special points
-            weights = torch.ones_like(x_tensor)
-            
-            for point, point_weight in zip(all_special_points, all_weights):
-                # Gaussian window centered at special point
-                gaussian_weights = point_weight * torch.exp(
-                    -0.5 * ((x_tensor - point) / gaussian_sigma) ** 2
-                )
-                weights += gaussian_weights
-        
-        # Compute weighted MSE for this batch item
-        y_diff = (y_pred_raw[b] - y_true_raw[b]) ** 2
-        weighted_loss = torch.sum(weights * y_diff)
-        weight_sum = torch.sum(weights)
-        
-        total_weighted_loss += weighted_loss
-        total_weight += weight_sum
-    
-    # Average across batch
-    if total_weight > 0:
-        return total_weighted_loss / total_weight
-    else:
-        return torch.mean((y_pred_raw - y_true_raw) ** 2)
-
-
-def train_model(model, train_loader, val_loader, num_epochs=50):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-
+def compute_robust_param_stats(train_loader, percentile_range=(5, 95)):
+    """
+    Compute parameter statistics using percentiles to handle outliers better.
+    This addresses the issue where extreme coefficients are being clipped.
+    """
+    print("Computing robust parameter statistics...")
     all_params = []
-    for i in range(len(train_loader.dataset)):
-        p = train_loader.dataset[i]['parameters']
-        if isinstance(p, torch.Tensor):
-            p = p.cpu().numpy()
-        all_params.append(np.array(p, dtype=np.float32))
-    all_params = np.stack(all_params, axis=0)
-    param_mean_np = all_params.mean(axis=0)
-    param_std_np = all_params.std(axis=0)
-    param_std_np = np.maximum(param_std_np, 1e-2)  # floor tiny stds
-    param_mean = torch.tensor(param_mean_np, dtype=torch.float32, device=device)
-    param_std = torch.tensor(param_std_np, dtype=torch.float32, device=device)
-    model.param_mean = param_mean
-    model.param_std = param_std
+    sample_count = 0
 
-    x_np = np.linspace(-5.0, 5.0, 300)
-    x_tensor = torch.tensor(x_np, dtype=torch.float32, device=device)
-    x_powers = torch.stack([x_tensor ** i for i in range(7)], dim=1)  # (N,7)
+    for batch in train_loader:
+        params = batch['parameters'].cpu().numpy()
+        all_params.append(params)
+        sample_count += params.shape[0]
+        if sample_count > 5000:  # Use more samples for better statistics
+            break
 
-    # hyperparams
-    param_weight = 1.0
-    y_weight = 40.0
-    param_clamp = 2.0
-    l2_param_coeff = 1e-3
-    
-    # New hyperparams for special points
-    crit_point_weight = 100.0      # Weight for critical points
-    inflection_weight = 50.0      # Weight for inflection points
-    gaussian_sigma = 0.4         # Sigma for gaussian windows
-    special_points_ratio = 0.99   # How much of y_loss should come from special points
+    all_params = np.concatenate(all_params, axis=0)
 
-    criterion_reg = nn.SmoothL1Loss()
-    criterion_y = nn.MSELoss()
+    # Use percentiles instead of mean/std to handle outliers
+    param_min = np.percentile(all_params, percentile_range[0], axis=0)
+    param_max = np.percentile(all_params, percentile_range[1], axis=0)
 
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    # Center and scale based on percentile range
+    param_center = (param_min + param_max) / 2
+    param_scale = np.maximum((param_max - param_min) / 2, 0.01)
 
-    print("Param mean:", param_mean_np)
-    print("Param std (floored):", param_std_np)
-    print(f"Special points weighting: crit={crit_point_weight}, inflection={inflection_weight}, sigma={gaussian_sigma}")
+    print(f"Parameter ranges ({percentile_range[0]}th-{percentile_range[1]}th percentile):")
+    coeff_names = ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6']
+    for i, name in enumerate(coeff_names):
+        print(f"  {name}: [{param_min[i]:.3f}, {param_max[i]:.3f}] -> center={param_center[i]:.3f}, scale={param_scale[i]:.3f}")
+
+    return (torch.tensor(param_center, dtype=torch.float32),
+            torch.tensor(param_scale, dtype=torch.float32))
+
+
+def train_model(model, train_loader, val_loader, num_epochs=30):
+    """
+    Training with adaptive bounds that grow during training to prevent saturation.
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    # Compute robust parameter statistics
+    param_center, param_scale = compute_robust_param_stats(train_loader)
+    param_center = param_center.to(device)
+    param_scale = param_scale.to(device)
+
+    print(f"Using robust normalization:")
+    print(f"  Centers: {param_center}")
+    print(f"  Scales: {param_scale}")
+
+    # Loss components
+    mse_criterion = nn.MSELoss()
+    huber_criterion = nn.HuberLoss(delta=0.5)  # Smaller delta for better precision
+
+    # Optimizer with lower learning rate for stability
+    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.7, patience=4)
+
+    inv = 1.0 / (param_scale + 1e-8)
+    coeff_weights = (inv / inv.mean()).to(device)   # mean-normalized
 
     best_val_loss = float('inf')
     patience_counter = 0
@@ -170,135 +81,172 @@ def train_model(model, train_loader, val_loader, num_epochs=50):
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
+        train_mse = 0.0
+        train_batches = 0
+
+        # Data-driven base bound: scale by the largest robust scale; allow gentle epoch growth
+        max_norm_scale = float(torch.max(param_scale).item())
+        base_bound = max(2.0, 3.0 * max_norm_scale)
+        bound_factor = min(8.0, base_bound * (1.0 + epoch * 0.02))  # slow growth, higher cap
 
         for batch_idx, batch in enumerate(train_loader):
             images = batch['image'].to(device)
-            param_labels_raw = batch['parameters'].to(device).float()
+            params_true = batch['parameters'].to(device).float()
+
+            # Robust normalization: (x - center) / scale
+            params_norm = (params_true - param_center) / (param_scale + 1e-8)
 
             optimizer.zero_grad()
-            param_pred = model(images)  # model returns just param predictions
 
-            param_labels_norm = (param_labels_raw - param_mean) / param_std
-            param_pred_bounded = torch.tanh(param_pred) * param_clamp
+            # Forward pass
+            params_pred_raw = model(images)
 
-            loss_reg = criterion_reg(param_pred_bounded, param_labels_norm)
+            params_pred = torch.tanh(params_pred_raw)
 
-            param_pred_denorm = param_pred_bounded * param_std + param_mean
-            
-            # Compute standard y loss
-            y_pred_raw = torch.matmul(param_pred_denorm, x_powers.T)    # (B, N)
-            y_true_raw = torch.matmul(param_labels_raw, x_powers.T)     # (B, N)
+            # Multi-component loss with coefficient importance
+            mse_loss = mse_criterion(params_pred, params_norm)
+            huber_loss = huber_criterion(params_pred, params_norm)
 
-            # Normalize y to [-1, 1] by dividing by axis_range (5)
-            axis_range = 5.0
-            y_pred_norm = y_pred_raw / axis_range
-            y_true_norm = y_true_raw / axis_range
+            # Weighted MSE (importance per coefficient)
+            weighted_mse = torch.mean(coeff_weights * (params_pred - params_norm) ** 2)
 
-            # Standard uniform y loss
-            loss_y_uniform = criterion_y(y_pred_norm, y_true_norm)
-            
-            # Special points weighted loss
-            loss_y_special = compute_special_points_loss(
-                param_pred_denorm, param_labels_raw, x_tensor, x_powers,
-                crit_weight=crit_point_weight, 
-                inflection_weight=inflection_weight,
-                gaussian_sigma=gaussian_sigma
+            # encourage predicted magnitude to match data magnitude
+            pred_mag = torch.mean(torch.abs(params_pred))
+            target_mag = torch.mean(torch.abs(params_norm)).detach().clamp(min=1e-6)
+            magnitude_loss = (pred_mag - target_mag) ** 2
+
+            # zero-coefficient penalty (in normalized space)
+            zero_tol = 1e-6
+            zero_mask = (torch.abs(params_norm) < zero_tol).float()
+            zero_penalty = torch.mean(zero_mask * (params_pred ** 2))
+
+            # Total loss
+            total_loss = (
+                0.4 * mse_loss
+                + 0.3 * huber_loss
+                + 0.2 * weighted_mse
+                + 0.01 * magnitude_loss
+                + 0.005 * zero_penalty
             )
-            
-            # Combine uniform and special points losses
-            loss_y = ((1 - special_points_ratio) * loss_y_uniform + 
-                     special_points_ratio * loss_y_special)
 
-            l2_penalty = l2_param_coeff * torch.mean(param_pred_denorm ** 2)
-
-            total_loss = (param_weight * loss_reg +
-                          y_weight * loss_y +
-                          l2_penalty)
+            # L2 regularization
+            l2_reg = 0.0005 * torch.mean(params_pred_raw ** 2)
+            total_loss = total_loss + l2_reg
 
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Gradient clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.5)
+
             optimizer.step()
 
+            # Metrics
             train_loss += total_loss.item()
+            train_mse += mse_loss.item()
+            train_batches += 1
 
-            if batch_idx % 20 == 0:
-                print(f"Epoch {epoch+1}, Batch {batch_idx}/{len(train_loader)}, "
-                      f"Total: {total_loss.item():.6f}, "
-                      f"Reg: {loss_reg.item():.6f}, Y_uniform: {loss_y_uniform.item():.6f}, "
-                      f"Y_special: {loss_y_special.item():.6f}, L2: {l2_penalty.item():.6f}")
-                print("  max|denorm_params|:", param_pred_denorm.abs().max().item(),
-                      "max|y_pred_raw|:", y_pred_raw.abs().max().item())
+            # logging
+            if batch_idx % 150 == 0:
+                # Denormalize for interpretability
+                params_pred_denorm = params_pred * (param_scale + 1e-8) + param_center
 
+                # saturation diagnostics
+                pred_abs = torch.abs(params_pred)
+                pred_range = pred_abs.max()
+                saturation_pct = (pred_range / bound_factor * 100).item()
+                saturated = (pred_abs > 0.99 * bound_factor).float()
+                saturation_frac = saturated.mean().item()
+
+                print(f"Epoch {epoch+1}, Batch {batch_idx}: Loss={total_loss.item():.6f}")
+                print(f"  MSE: {mse_loss.item():.4f}, Huber: {huber_loss.item():.4f}")
+                print(f"  Bound factor: {bound_factor:.2f}, Pred mag: {pred_mag.item():.3f}")
+                print(f"  Grad norm: {grad_norm:.3f}")
+
+                # Show sample comparison
+                true_sample = params_true[0][:]
+                pred_sample = params_pred_denorm[0][:]
+                print(f"  Sample 0 True: {true_sample.detach().cpu().numpy()}")
+                print(f"  Sample 0 Pred: {pred_sample.detach().cpu().numpy()}")
+
+                print(f"  Max prediction: {pred_range.item():.2f}/{bound_factor:.2f} ({saturation_pct:.1f}%)")
+                print(f"  Saturation fraction (coeffs near bound): {saturation_frac:.3f}")
+
+                if saturation_pct > 90 or saturation_frac > 0.25:
+                    print(f"High saturation!")
+
+        # Validation
         model.eval()
         val_loss = 0.0
+        val_mse = 0.0
+        val_batches = 0
+
         with torch.no_grad():
             for batch in val_loader:
                 images = batch['image'].to(device)
-                param_labels_raw = batch['parameters'].to(device).float()
+                params_true = batch['parameters'].to(device).float()
+                params_norm = (params_true - param_center) / (param_scale + 1e-8)
 
-                param_pred = model(images)
-                param_labels_norm = (param_labels_raw - param_mean) / param_std
+                params_pred_raw = model(images)
+                params_pred = torch.tanh(params_pred_raw)
 
-                param_pred_bounded = torch.tanh(param_pred) * param_clamp
-                loss_reg = criterion_reg(param_pred_bounded, param_labels_norm)
+                mse_loss = mse_criterion(params_pred, params_norm)
+                huber_loss = huber_criterion(params_pred, params_norm)
+                weighted_mse = torch.mean(coeff_weights * (params_pred - params_norm) ** 2)
 
-                param_pred_denorm = param_pred_bounded * param_std + param_mean
+                pred_mag = torch.mean(torch.abs(params_pred))
+                target_mag = torch.mean(torch.abs(params_norm)).clamp(min=1e-6)
+                magnitude_loss = (pred_mag - target_mag) ** 2
 
-                # Compute y predictions & truth (need to flip coeffs for x_powers multiplication)
-                y_pred_raw = torch.matmul(param_pred_denorm.flip(-1), x_powers.T)    # (B, N)
-                y_true_raw = torch.matmul(param_labels_raw.flip(-1), x_powers.T)     # (B, N)
+                zero_tol = 1e-6
+                zero_mask = (torch.abs(params_norm) < zero_tol).float()
+                zero_penalty = torch.mean(zero_mask * (params_pred ** 2))
 
-                # Normalize y to [-1, 1] by dividing by axis_range (5)
-                axis_range = 5.0
-                y_pred_norm = y_pred_raw / axis_range
-                y_true_norm = y_true_raw / axis_range
+                l2_reg = 0.0005 * torch.mean(params_pred_raw ** 2)
 
-                # Standard uniform y loss
-                loss_y_uniform = criterion_y(y_pred_norm, y_true_norm)
-                
-                # Special points weighted loss
-                loss_y_special = compute_special_points_loss(
-                    param_pred_denorm, param_labels_raw, x_tensor, x_powers,
-                    crit_weight=crit_point_weight, 
-                    inflection_weight=inflection_weight,
-                    gaussian_sigma=gaussian_sigma
+                total_loss = (
+                    0.4 * mse_loss
+                    + 0.3 * huber_loss
+                    + 0.2 * weighted_mse
+                    + 0.01 * magnitude_loss
+                    + 0.05 * zero_penalty
+                    + l2_reg
                 )
-                
-                # Combine uniform and special points losses
-                loss_y = ((1 - special_points_ratio) * loss_y_uniform + 
-                         special_points_ratio * loss_y_special)
-
-                l2_penalty = l2_param_coeff * torch.mean(param_pred_denorm ** 2)
-
-                total_loss = (param_weight * loss_reg +
-                              y_weight * loss_y +
-                              l2_penalty)
 
                 val_loss += total_loss.item()
+                val_mse += mse_loss.item()
+                val_batches += 1
 
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+        avg_train_loss = train_loss / max(1, train_batches)
+        avg_val_loss = val_loss / max(1, val_batches)
+        avg_train_mse = train_mse / max(1, train_batches)
+        avg_val_mse = val_mse / max(1, val_batches)
 
-        print(f"Epoch {epoch+1}/{num_epochs}: Train Loss: {avg_train_loss:.6f}")
-        print(f"                  Val   Loss: {avg_val_loss:.6f}")
+        print(f"\nEpoch {epoch+1}/{num_epochs}:")
+        print(f"  Train Loss: {avg_train_loss:.6f} (MSE: {avg_train_mse:.6f})")
+        print(f"  Val Loss:   {avg_val_loss:.6f} (MSE: {avg_val_mse:.6f})")
+        print(f"  Bound factor: {bound_factor:.2f}")
 
-        old_lr = optimizer.param_groups[0]['lr']
         scheduler.step(avg_val_loss)
-        new_lr = optimizer.param_groups[0]['lr']
-        if new_lr != old_lr:
-            print("  LR reduced to", new_lr)
 
+        # Save best model
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), MODEL_PATH)
+            try:
+                torch.save(model.state_dict(), MODEL_PATH)
+                print(f"  New best model saved! Val loss: {avg_val_loss:.6f}")
+            except Exception as e:
+                print("ERROR SAVING BEST MODEL:", str(e))
         else:
             patience_counter += 1
-            if patience_counter >= 10:
-                print("Early stopping")
-                break
 
+        if patience_counter >= 8:
+            print("Early stopping triggered")
+            break
+
+    # Load best model
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    print(f"Training completed. Best validation loss: {best_val_loss:.6f}")
     return model
 
 

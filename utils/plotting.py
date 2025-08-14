@@ -16,7 +16,7 @@ def render_plot_to_tensor(func_type, params):
         x = np.linspace(-5.0, 5.0, 300)
         
         # Add slight noise to make it more realistic
-        noise_level = random.uniform(0, 0.005)
+        noise_level = random.uniform(0, 0.002)
         
         try:
             y = generate_equation(func_type, params, x)
@@ -35,7 +35,7 @@ def render_plot_to_tensor(func_type, params):
                    linestyle=random.choice(line_styles),
                    linewidth=random.choice(line_widths))
             
-            # FIXED axis limits: 10x10 units
+            # axis limits: 10x10 units
             ax.set_xlim(-5.0, 5.0)
             ax.set_ylim(-5.0, 5.0)
             
